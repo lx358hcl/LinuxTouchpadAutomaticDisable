@@ -1,13 +1,10 @@
 import subprocess
 import threading
 import signal
-import time
 import sys
 import logging
 import argparse
-
-# Global variable
-touchpad_id_global = None
+import re
 
 
 # Setup logging
@@ -17,33 +14,25 @@ def setup_logging(log_level):
     )
 
 
-def disable_tap_to_click(touchpad_id):
-    """Disables tap-to-click feature of the touchpad."""
-    logging.info("Disabling tap-to-click")
-    run_command(["xinput", "set-prop", touchpad_id, "337", "0"])
-
-
-def enable_tap_to_click(touchpad_id):
-    """Enables tap-to-click feature of the touchpad."""
-    logging.info("Enabling tap-to-click")
-    run_command(["xinput", "set-prop", touchpad_id, "337", "1"])
-
-
 def run_command(command):
-    """Executes a command and handles exceptions."""
     try:
-        subprocess.run(command, check=True)
+        return subprocess.check_output(command, text=True).strip()
     except subprocess.CalledProcessError as e:
-        logging.error(f"Error executing command: {e}")
-        sys.exit(1)
+        print(f"Command failed: {e}")
+        return None
 
 
-def toggle_touchpad(touchpad_id, enable):
-    """Toggles the touchpad state."""
-    if enable:
-        enable_tap_to_click(touchpad_id)
-    else:
-        disable_tap_to_click(touchpad_id)
+def toggle_tap_to_click(touchpad_id):
+    try:
+        result = subprocess.run(
+            ["./toggleTapToClick.sh", str(touchpad_id)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e.stderr}")
 
 
 def listen_for_keypress(event, keyboard_id):
@@ -58,60 +47,86 @@ def listen_for_keypress(event, keyboard_id):
                 event.set()
     except subprocess.SubprocessError as e:
         logging.error(f"Error in listen_for_keypress: {e}")
-        sys.exit(1)
 
 
-def set_touchpad_state(event, touchpad_id, wait_time):
+def set_touchpad_state(event, touchpad_ids, wait_time):
     """Controls the touchpad state based on keyboard activity."""
-    disabled = False
     try:
         while True:
-            event.wait(wait_time)
-            if event.is_set() and not disabled:
-                toggle_touchpad(touchpad_id, False)
-                disabled = True
-            elif not event.is_set() and disabled:
-                toggle_touchpad(touchpad_id, True)
-                disabled = False
-            event.clear()
+            event.wait()
+            for touchPadId in touchpad_ids:
+                toggle_tap_to_click(touchPadId)
+                event.clear()
+                # Wait for a period of inactivity before re-enabling the touchpad
+                event.wait(wait_time)
+                toggle_tap_to_click(touchPadId)
     except KeyboardInterrupt:
         logging.info("Terminating script")
 
 
-def signal_handler(signum, frame):
-    global touchpad_id_global
-    logging.info("Signal received, terminating script and enabling touchpad")
-    toggle_touchpad(touchpad_id_global, True)
-    sys.exit(0)
+def signal_handler(touchpad_ids):
+    def handle_signum(signum, frame):
+        logging.info("Signal received, terminating script and enabling touchpad")
+        for touchPadId in touchpad_ids:
+            toggle_tap_to_click(touchPadId)
+            sys.exit(0)
+
+    return handle_signum
+
+
+def find_device_ids(keyword):
+    """Finds the device IDs for a given keyword (e.g., 'touchpad', 'keyboard')."""
+    device_ids = []
+    try:
+        output = subprocess.check_output(["xinput", "--list"], text=True)
+        for line in output.splitlines():
+            if keyword.lower() in line.lower():
+                match = re.search(r"id=(\d+)", line)
+                if match:
+                    device_ids.append(match.group(1))
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error finding {keyword} device IDs: {e}")
+
+    print("Ids are: ", device_ids)
+    return device_ids
 
 
 def main():
-    global touchpad_id_global
     parser = argparse.ArgumentParser(
         description="Control touchpad based on keyboard activity."
     )
-    parser.add_argument("touchpad_id", type=str, help="Touchpad device ID")
-    parser.add_argument("keyboard_id", type=str, help="Keyboard device ID")
     parser.add_argument("wait_time", type=float, help="Waiting time in seconds")
     parser.add_argument("--log_level", type=str, default="INFO", help="Log level")
     args = parser.parse_args()
 
     setup_logging(getattr(logging, args.log_level.upper(), logging.INFO))
 
-    touchpad_id_global = args.touchpad_id
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    touchpad_ids = find_device_ids("touchpad")
+    keyboard_ids = find_device_ids("keyboard")
+
+    if not touchpad_ids or not keyboard_ids:
+        logging.error("Could not find touchpad or keyboard IDs")
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, signal_handler(touchpad_ids))
+    signal.signal(signal.SIGTERM, signal_handler(touchpad_ids))
 
     event = threading.Event()
-    keypress_thread = threading.Thread(
-        target=listen_for_keypress, args=(event, args.keyboard_id), daemon=True
-    )
-    keypress_thread.start()
+
+    # Create and start a thread for each keyboard ID
+    for keyboard_id in keyboard_ids:
+        keypress_thread = threading.Thread(
+            target=listen_for_keypress, args=(event, keyboard_id), daemon=True
+        )
+        keypress_thread.start()
 
     try:
-        set_touchpad_state(event, args.touchpad_id, args.wait_time)
+        set_touchpad_state(event, touchpad_ids, args.wait_time)
     finally:
-        keypress_thread.join()
+        # Wait for all keypress threads to finish (optional)
+        for thread in threading.enumerate():
+            if thread is not threading.current_thread():
+                thread.join()
 
 
 if __name__ == "__main__":
